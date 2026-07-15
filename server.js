@@ -38,6 +38,7 @@ const rateLimit = require('express-rate-limit');
 const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
+app.set('trust proxy', 1); // Render est derrière un proxy — nécessaire pour express-rate-limit
 app.use(cors());
 app.use(express.json());
 
