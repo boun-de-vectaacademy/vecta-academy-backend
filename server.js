@@ -47,8 +47,8 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SER
    Limitation des requêtes abusives (rate limiting)
    ------------------------------------------------------- */
 const webhookLimiter = rateLimit({
-  windowMs: 60 * 1000,   // 1 minute
-  max: 120,              // 120 requêtes/minute max sur le webhook
+  windowMs: 60 * 1000,
+  max: 120,
   standardHeaders: true,
   legacyHeaders: false,
 });
@@ -60,9 +60,7 @@ const apiLimiter = rateLimit({
 });
 
 /* -------------------------------------------------------
-   Vérification d'origine du webhook (token secret dans l'URL,
-   voir note en tête de fichier : Chariow n'expose pas de secret
-   de signature HMAC par Pulse au moment de l'écriture de ce code)
+   Vérification d'origine du webhook (token secret dans l'URL)
    ------------------------------------------------------- */
 function requeteAutorisee(req){
   const token = req.query.token;
@@ -202,6 +200,20 @@ app.post('/webhooks/chariow', webhookLimiter, async (req, res) => {
 /* -------------------------------------------------------
    API en lecture consommée par l'application web VECTA
    ------------------------------------------------------- */
+app.get('/api/utilisateur/par-email/:email', apiLimiter, async (req, res) => {
+  const email = decodeURIComponent(req.params.email).trim().toLowerCase();
+  const { data, error } = await supabase
+    .from('utilisateurs')
+    .select('id, vecta_id, nom, email, telephone, photo_url, statut')
+    .ilike('email', email)
+    .maybeSingle();
+
+  if (error) return res.status(500).json({ error: 'Erreur serveur' });
+  if (!data) return res.status(404).json({ error: 'Aucun compte trouvé pour cet email. Le paiement Chariow a-t-il bien été confirmé ?' });
+  if (data.statut !== 'actif') return res.status(403).json({ error: 'Compte non actif' });
+  res.json(data);
+});
+
 app.get('/api/affiliation/:utilisateurId', apiLimiter, async (req, res) => {
   const { data, error } = await supabase
     .from('affiliation')
