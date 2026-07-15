@@ -1,25 +1,32 @@
 /**
  * VECTA ACADEMY — Serveur de référence (Node.js / Express)
  * -----------------------------------------------------------
- * Ce fichier est un POINT DE DÉPART à déployer sur un vrai serveur
- * (Render, Railway, VPS...). Il ne peut pas tourner dans cet
- * environnement de démo (pas d'accès réseau sortant, pas de
- * variables d'environnement réelles).
+ * RÈGLE D'ARCHITECTURE (ne pas casser en modifiant ce fichier) :
+ * Chariow reste le SEUL système de vérité pour l'affiliation, les
+ * ventes, les commissions, les paiements et les retraits. Ce serveur
+ * ne fait QUE :
+ *   1. Recevoir les webhooks Chariow (Pulses) et vérifier leur origine
+ *   2. Copier ces données telles quelles dans Supabase (aucun calcul
+ *      de commission, aucune logique de paiement)
+ *   3. Exposer une API en lecture pour que l'app VECTA affiche un
+ *      tableau de bord identique aux données Chariow
+ * VECTA ne gère jamais l'argent, ne déclenche jamais de retrait, et
+ * ne recrée pas de système d'affiliation indépendant.
  *
- * Il montre comment :
- *  1. Recevoir les Pulses (webhooks) Chariow en sécurité
- *  2. Mettre à jour les statistiques d'un affilié dans Supabase
- *  3. Exposer une API pour que l'app web VECTA lise ces données
+ * Ce fichier est un POINT DE DÉPART à déployer sur un vrai serveur
+ * (Render...). Il ne peut pas tourner dans l'environnement de démo
+ * Claude (pas d'accès réseau sortant, pas de vraies variables d'env).
  *
  * Installation :
- *   npm init -y
- *   npm install express @supabase/supabase-js crypto dotenv cors
+ *   npm install
  *   node server.js
  *
- * Variables d'environnement nécessaires (.env) :
+ * Variables d'environnement nécessaires (à mettre dans Render, jamais
+ * dans le code ni sur GitHub) :
  *   SUPABASE_URL=...
- *   SUPABASE_SERVICE_KEY=...     (clé secrète, JAMAIS côté client)
- *   CHARIOW_WEBHOOK_TOKEN=...   (choisi par vous, ajouté dans l'URL du Pulse)
+ *   SUPABASE_SERVICE_KEY=...        (clé secrète, jamais côté client)
+ *   CHARIOW_WEBHOOK_TOKEN=...       (mot de passe choisi par vous,
+ *                                    ajouté dans l'URL du Pulse Chariow)
  *   PORT=3000
  */
 
@@ -27,27 +34,37 @@ require('dotenv').config();
 const express = require('express');
 const crypto = require('crypto');
 const cors = require('cors');
+const rateLimit = require('express-rate-limit');
 const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 app.use(cors());
+app.use(express.json());
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
-/**
- * IMPORTANT : express.json({verify}) nous permet de garder le corps
- * brut de la requête pour vérifier la signature du webhook AVANT
- * de faire confiance aux données.
- */
-app.use(express.json({
-  verify: (req, res, buf) => { req.rawBody = buf; }
-}));
+/* -------------------------------------------------------
+   Limitation des requêtes abusives (rate limiting)
+   ------------------------------------------------------- */
+const webhookLimiter = rateLimit({
+  windowMs: 60 * 1000,   // 1 minute
+  max: 120,              // 120 requêtes/minute max sur le webhook
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+const apiLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 300,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
 
-function verifChariowSignature(req){
-  // Chariow n'expose pas de secret de signature HMAC par Pulse au moment
-  // de l'écriture de ce code : on sécurise donc le webhook avec un token
-  // secret que NOUS choisissons, glissé dans l'URL du Pulse
-  // (ex: https://xxx.onrender.com/webhooks/chariow?token=VOTRE_TOKEN).
+/* -------------------------------------------------------
+   Vérification d'origine du webhook (token secret dans l'URL,
+   voir note en tête de fichier : Chariow n'expose pas de secret
+   de signature HMAC par Pulse au moment de l'écriture de ce code)
+   ------------------------------------------------------- */
+function requeteAutorisee(req){
   const token = req.query.token;
   const expected = process.env.CHARIOW_WEBHOOK_TOKEN;
   if (!token || !expected || token.length !== expected.length) return false;
@@ -55,30 +72,53 @@ function verifChariowSignature(req){
 }
 
 /* -------------------------------------------------------
-   Webhook Chariow — Pulses (vente finalisée, paiement reçu,
-   remboursement, nouvel affilié, etc.)
+   Validation basique des données reçues
    ------------------------------------------------------- */
-app.post('/webhooks/chariow', async (req, res) => {
-  if (!verifChariowSignature(req)) {
-    return res.status(401).json({ error: 'Signature invalide' });
+function evenementValide(event){
+  return event && typeof event.type === 'string' && event.data && event.id;
+}
+
+/* -------------------------------------------------------
+   Webhook Chariow — Pulses
+   ------------------------------------------------------- */
+app.post('/webhooks/chariow', webhookLimiter, async (req, res) => {
+  if (!requeteAutorisee(req)) {
+    return res.status(401).json({ error: 'Non autorisé' });
   }
 
   const event = req.body;
+  if (!evenementValide(event)) {
+    return res.status(400).json({ error: 'Payload invalide' });
+  }
 
   try {
+    const { error: insertLogError } = await supabase
+      .from('evenements_webhook')
+      .insert({
+        chariow_event_id: event.id,
+        type_evenement: event.type,
+        payload: event
+      });
+
+    if (insertLogError) {
+      if (insertLogError.code === '23505') {
+        return res.status(200).json({ received: true, duplicate: true });
+      }
+      throw insertLogError;
+    }
+
     switch (event.type) {
 
       case 'sale.completed': {
-        const { data: utilisateur } = await supabase
+        const { data: utilisateurExistant } = await supabase
           .from('utilisateurs')
           .select('id')
           .eq('email', event.data.buyer_email)
-          .single();
+          .maybeSingle();
 
-        // Création automatique du compte si premier achat (Règle 1 du cahier des charges)
-        let utilisateurId = utilisateur?.id;
+        let utilisateurId = utilisateurExistant?.id;
         if (!utilisateurId) {
-          const { data: created } = await supabase
+          const { data: created, error: createErr } = await supabase
             .from('utilisateurs')
             .insert({
               vecta_id: 'VECTA-' + Math.floor(100000 + Math.random() * 900000),
@@ -88,8 +128,8 @@ app.post('/webhooks/chariow', async (req, res) => {
             })
             .select()
             .single();
+          if (createErr) throw createErr;
           utilisateurId = created.id;
-          // TODO: envoyer l'email de bienvenue + déclencher l'inscription Systeme.io
         }
 
         await supabase.from('paiements').insert({
@@ -99,13 +139,12 @@ app.post('/webhooks/chariow', async (req, res) => {
           statut: 'valide'
         });
 
-        // Si la vente vient d'un affilié, on met à jour ses stats
-        if (event.data.affiliate_id) {
+        if (event.data.affiliate_email) {
           const { data: affilie } = await supabase
             .from('utilisateurs')
             .select('id')
-            .eq('vecta_id', event.data.affiliate_ref) // à adapter selon le mapping choisi
-            .single();
+            .eq('email', event.data.affiliate_email)
+            .maybeSingle();
 
           if (affilie) {
             await supabase.from('ventes').insert({
@@ -117,15 +156,14 @@ app.post('/webhooks/chariow', async (req, res) => {
               statut: 'confirmee'
             });
 
-            await supabase.rpc('incrementer_stats_affilie', {
-              p_utilisateur_id: affilie.id,
-              p_commission: event.data.commission_amount
+            await supabase.rpc('recalculer_agregat_affilie', {
+              p_utilisateur_id: affilie.id
             });
 
             await supabase.from('notifications').insert({
               utilisateur_id: affilie.id,
               titre: '🎉 Nouvelle vente enregistrée',
-              message: `Vous avez gagné ${event.data.commission_amount} FCFA sur "${event.data.product_name}"`,
+              message: `Chariow indique ${event.data.commission_amount} FCFA de commission sur "${event.data.product_name}"`,
               type: 'affiliation'
             });
           }
@@ -142,8 +180,6 @@ app.post('/webhooks/chariow', async (req, res) => {
       }
 
       case 'affiliate.joined': {
-        // Un nouvel affilié a rejoint le programme Chariow
-        // → à relier à un utilisateur VECTA existant si possible
         break;
       }
 
@@ -151,27 +187,53 @@ app.post('/webhooks/chariow', async (req, res) => {
         console.log('Événement Chariow non géré :', event.type);
     }
 
+    await supabase
+      .from('evenements_webhook')
+      .update({ traite: true })
+      .eq('chariow_event_id', event.id);
+
     res.status(200).json({ received: true });
   } catch (err) {
-    console.error(err);
+    console.error('[webhook chariow] erreur :', err.message);
     res.status(500).json({ error: 'Erreur interne' });
   }
 });
 
 /* -------------------------------------------------------
-   API consommée par l'application web VECTA
+   API en lecture consommée par l'application web VECTA
    ------------------------------------------------------- */
-app.get('/api/affiliation/:utilisateurId', async (req, res) => {
+app.get('/api/affiliation/:utilisateurId', apiLimiter, async (req, res) => {
   const { data, error } = await supabase
     .from('affiliation')
-    .select('*, ventes(*)')
+    .select('*, ventes:ventes(*)')
     .eq('utilisateur_id', req.params.utilisateurId)
-    .single();
+    .maybeSingle();
 
-  if (error) return res.status(404).json({ error: 'Introuvable' });
+  if (error) return res.status(500).json({ error: 'Erreur serveur' });
+  if (!data) return res.status(404).json({ error: 'Introuvable' });
   res.json(data);
 });
 
+app.get('/api/profil/:utilisateurId', apiLimiter, async (req, res) => {
+  const { data, error } = await supabase
+    .from('utilisateurs')
+    .select('id, vecta_id, nom, email, telephone, photo_url, statut')
+    .eq('id', req.params.utilisateurId)
+    .maybeSingle();
+
+  if (error) return res.status(500).json({ error: 'Erreur serveur' });
+  if (!data) return res.status(404).json({ error: 'Introuvable' });
+  res.json(data);
+});
+
+/* -------------------------------------------------------
+   Gestion centralisée des erreurs non prévues
+   ------------------------------------------------------- */
+app.use((err, req, res, next) => {
+  console.error('[erreur non gérée]', err);
+  res.status(500).json({ error: 'Erreur serveur inattendue' });
+});
+
 app.listen(process.env.PORT || 3000, () => {
-  console.log('Serveur VECTA prêt à recevoir les webhooks Chariow.');
+  console.log('Serveur VECTA prêt (miroir Chariow) — en écoute.');
 });
