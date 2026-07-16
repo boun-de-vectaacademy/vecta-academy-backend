@@ -40,6 +40,15 @@ const { createClient } = require('@supabase/supabase-js');
 const app = express();
 app.set('trust proxy', 1); // Render est derrière un proxy — nécessaire pour express-rate-limit
 app.use(cors());
+
+// --- ESPION TEMPORAIRE : logge TOUTE requête entrante, quelle que soit
+// la route ou la méthode, pour diagnostiquer un problème de connexion.
+// À retirer une fois le problème résolu.
+app.use((req, res, next) => {
+  console.log(`[ESPION] ${req.method} ${req.originalUrl} — Content-Type: ${req.headers['content-type']}`);
+  next();
+});
+
 app.use(express.json());
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
@@ -81,12 +90,17 @@ function evenementValide(event){
    Webhook Chariow — Pulses
    ------------------------------------------------------- */
 app.post('/webhooks/chariow', webhookLimiter, async (req, res) => {
+  console.log('[DIAGNOSTIC] Token reçu :', req.query.token);
+  console.log('[DIAGNOSTIC] Corps reçu :', JSON.stringify(req.body));
+
   if (!requeteAutorisee(req)) {
+    console.log('[DIAGNOSTIC] Refusé : token invalide ou manquant');
     return res.status(401).json({ error: 'Non autorisé' });
   }
 
   const event = req.body;
   if (!evenementValide(event)) {
+    console.log('[DIAGNOSTIC] Refusé : payload jugé invalide par evenementValide()');
     return res.status(400).json({ error: 'Payload invalide' });
   }
 
